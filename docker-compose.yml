@@ -1,0 +1,427 @@
+version: '3.8'
+
+networks:
+  app_network:
+    driver: bridge
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: social_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker-config/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d social_platform"]
+      interval: 10s
+      retries: 5
+
+  redis:
+    image: redis:latest
+    container_name: redis_cache
+    restart: always
+    ports:
+      - "6379:6379"
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zookeeper:
+    image: wurstmeister/zookeeper
+    container_name: zookeeper
+    restart: always
+    ports:
+      - "2181:2181"
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: wurstmeister/kafka
+    container_name: kafka_broker
+    restart: always
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_BROKER_ID: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_DIRS: /kafka/logs
+    depends_on:
+      - zookeeper
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --list --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.2.0
+    container_name: elasticsearch
+    environment:
+    - discovery.type=single-node
+    - xpack.security.enabled=false
+    - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    - cluster.routing.allocation.disk.threshold_enabled=false  # 添加此行
+    - bootstrap.memory_lock=true  # 添加此行
+    ports:
+      - "9200:9200"
+    volumes:
+      - elastic_data:/usr/share/elasticsearch/data:rw
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -E '\"status\":\"(yellow|green)\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.2.0
+    container_name: kibana
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - app_network
+    volumes:
+      - ./docker-config/kibana/dashboard.ndjson:/usr/share/kibana/dashboard.ndjson
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:5601/api/status | grep -q 'All services are available'"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  minio:
+    image: minio/minio
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"  # API
+      - "9001:9001"  # 控制台
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio_data:/data
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    volumes:
+      - ./docker-config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - app_network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker-config/grafana/provisioning:/etc/grafana/provisioning
+      - ./docker-config/grafana/provisioning/dashboards:/var/lib/grafana/dashboards
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DATABASE_TYPE=postgres
+      - GF_DATABASE_HOST=postgres:5432
+      - GF_DATABASE_NAME=grafana
+      - GF_DATABASE_USER=admin
+      - GF_DATABASE_PASSWORD=password
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      prometheus:
+        condition: service_healthy
+
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  fluentd:
+    build:
+      context: ./docker-config/fluentd
+      dockerfile: Dockerfile
+    container_name: fluentd
+    volumes:
+      - ./docker-config/fluentd/conf:/fluentd/etc
+    ports:
+      - "24224:24224"
+      - "24224:24224/udp"
+    networks:
+      - app_network
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep fluentd | grep -v grep"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  nginx:
+    image: nginx:latest
+    container_name: api_gateway
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx-config:/etc/nginx/
+    depends_on:
+      user-service:
+        condition: service_healthy
+      post-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+      fluentd:
+        condition: service_healthy
+    networks:
+      - app_network
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: fluentd:24224
+        tag: nginx.access
+        fluentd-async-connect: "true"   # 👈 核心参数
+        fluentd-retry-wait: "5s"
+        fluentd-max-retries: "10"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   container_name: frontend
+  #   restart: always
+  #   depends_on:
+  #     - nginx
+  #   networks:
+  #     - app_network
+
+  user-service:
+    build:
+      context: ./user-service
+      dockerfile: Dockerfile
+    container_name: user-service
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql://admin:password@postgres:5432/social_platform_users
+      - SECRET_KEY=mysecretkey
+      - ALGORITHM=HS256
+      - ACCESS_TOKEN_EXPIRE_MINUTES=1440
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC_LOGS=service.logs
+      - KAFKA_TOPIC_NOTIFICATIONS=user.notifications
+      - LOG_LEVEL=INFO
+      - CORS_ORIGINS=["*"]
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_SECURE=false
+      - MINIO_USER_BUCKET=user-content
+      - GITHUB_CLIENT_ID=your_github_client_id
+      - GITHUB_CLIENT_SECRET=your_github_client_secret
+      - GOOGLE_CLIENT_ID=your_google_client_id
+      - GOOGLE_CLIENT_SECRET=your_google_client_secret
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      minio:
+        condition: service_healthy
+      fluentd:
+        condition: service_healthy
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      retries: 5
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: fluentd:24224
+        tag: user.service
+        fluentd-async-connect: "true"   # 👈 核心参数
+        fluentd-retry-wait: "5s"
+        fluentd-max-retries: "10"
+
+  post-service:
+    build:
+      context: ./post-service
+      dockerfile: Dockerfile
+    container_name: post-service
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql://admin:password@postgres:5432/social_platform_posts
+      - API_V1_STR=/api/v1
+      - JWT_SECRET_KEY=mysecretkey
+      - JWT_ALGORITHM=HS256
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC_POSTS=social.posts
+      - KAFKA_TOPIC_COMMENTS=social.comments
+      - KAFKA_TOPIC_REACTIONS=social.reactions
+      - KAFKA_TOPIC_NOTIFICATIONS=user.notifications
+      - KAFKA_TOPIC_LOGS=service.logs
+      - ELASTICSEARCH_HOST=elasticsearch
+      - ELASTICSEARCH_PORT=9200
+      - ELASTICSEARCH_INDEX_POSTS=posts
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+      - MINIO_SECURE=false
+      - MINIO_POST_BUCKET=post-content
+      - LOG_LEVEL=INFO
+      - USER_SERVICE_BASE_URL=http://user-service:8000/api/v1
+      - CORS_ORIGINS=["*"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      minio:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_started
+      user-service:
+        condition: service_healthy
+      fluentd:
+        condition: service_healthy
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      retries: 5
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: fluentd:24224
+        tag: post.service
+        fluentd-async-connect: "true"   # 👈 核心参数
+        fluentd-retry-wait: "5s"
+        fluentd-max-retries: "10"
+
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    container_name: notification-service
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql://admin:password@postgres:5432/social_platform_notifications
+      - API_V1_STR=/api/v1
+      - JWT_SECRET_KEY=mysecretkey
+      - JWT_ALGORITHM=HS256
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_CHANNEL=notifications
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC_NOTIFICATIONS=user.notifications
+      - KAFKA_TOPIC_POSTS=social.posts
+      - KAFKA_TOPIC_COMMENTS=social.comments
+      - KAFKA_TOPIC_REACTIONS=social.reactions
+      - KAFKA_CONSUMER_GROUP=notification-service-group
+      - LOG_LEVEL=INFO
+      - USER_SERVICE_BASE_URL=http://user-service:8000/api/v1
+      - WEBSOCKET_PATH=/ws/notifications
+      - CORS_ORIGINS=["*"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      user-service:
+        condition: service_healthy
+      fluentd:
+        condition: service_healthy
+    networks:
+      - app_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      retries: 5
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: fluentd:24224
+        tag: notification.service
+        fluentd-async-connect: "true"   # 👈 核心参数
+        fluentd-retry-wait: "5s"
+        fluentd-max-retries: "10"
+        
+
+volumes:
+  postgres_data:
+  elastic_data:
+  minio_data:
+  prometheus_data:
+  grafana_data:
